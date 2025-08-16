@@ -1,101 +1,157 @@
-import os, time, re, threading, random
+import os
+import time
+import re
 import requests
 from bs4 import BeautifulSoup
 from flask import Flask
 
-# === Config via environment variables ===
-BOT_TOKEN   = os.environ["BOT_TOKEN"]
-CHAT_ID     = os.environ["CHAT_ID"]
-CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL", "300"))
-MAX_PRICE      = int(os.environ.get("MAX_PRICE", "800"))
+# ── Конфиг из переменных окружения ─────────────────────────────────────────────
+BOT_TOKEN       = os.environ["BOT_TOKEN"]
+CHAT_ID         = os.environ["CHAT_ID"]
+DEFAULT_MAX     = int(os.environ.get("MAX_PRICE", "800"))
+CHECK_INTERVAL  = int(os.environ.get("CHECK_INTERVAL", "300"))
 
-SEARCH_URLS = {
-    "WG-Zimmer": "https://www.wg-gesucht.de/wg-zimmer-in-Muenchen.90.0.1.0.html?offer_filter=1&city_id=90&category=0&rent_type=0&ot%5B%5D=147&ot%5B%5D=148&ot%5B%5D=149&ot%5B%5D=102&ot%5B%5D=100&ot%5B%5D=95&from=01.09.2025&to=01.08.2026",
-    "1-Zimmer-Wohnung": "https://www.wg-gesucht.de/1-zimmer-wohnungen-in-Muenchen.90.1.1.0.html?offer_filter=1&city_id=90&category=1&rent_type=0&ot%5B%5D=147&ot%5B%5D=148&ot%5B%5D=149&ot%5B%5D=102&ot%5B%5D=100&ot%5B%5D=95&from=01.09.2025&to=01.08.2026"
-}
+# Глобальный лимит цены (можно менять командой /setprice)
+runtime_max_price = DEFAULT_MAX
+
+# Источники (можете заменить на свои отфильтрованные ссылки WG-Gesucht)
+SEARCH_URLS = [
+    "https://www.wg-gesucht.de/1-zimmer-wohnungen-in-Muenchen.90.1.1.0.html",
+    "https://www.wg-gesucht.de/wg-zimmer-in-Muenchen.90.0.1.0.html"
+]
 
 TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
+HEADERS = {"User-Agent": "Mozilla/5.0"}
+
+# Память
 seen_ids = set()
+last_update_id = 0  # чтобы не обрабатывать апдейты повторно
 
-def send_msg(text: str):
-    try:
-        requests.post(f"{TG_API}/sendMessage", data={"chat_id": CHAT_ID, "text": text, "disable_web_page_preview": True}, timeout=15)
-    except Exception as e:
-        print("send_msg error:", e)
-
-def send_photo(photo_url: str, caption: str):
-    try:
-        requests.post(f"{TG_API}/sendPhoto", data={"chat_id": CHAT_ID, "caption": caption, "photo": photo_url}, timeout=30)
-    except Exception as e:
-        print("send_photo error:", e); send_msg(caption)
-
-def fetch_offers(url, category):
-    r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=30)
-    soup = BeautifulSoup(r.text, "html.parser")
-    offers = []
-    for div in soup.find_all("div", {"class": "offer_list_item"}):
-        offer_id = div.get("adid") or div.get("id") or str(hash(div))
-        title_tag = div.find("h3")
-        link_tag = div.find("a", href=True)
-
-        price = None
-        price_tag = div.find("div", class_=re.compile("col-xs-3"))
-        if price_tag:
-            m = re.search(r"(\d+)", price_tag.get_text(strip=True))
-            if m: price = int(m.group(1))
-
-        size = None
-        size_tag = div.find("div", class_=re.compile("col-xs-2"))
-        if size_tag:
-            m = re.search(r"(\d+)", size_tag.get_text(strip=True))
-            if m: size = m.group(1) + " m²"
-
-        move_in = None
-        move_in_tag = div.find("div", class_=re.compile("col-xs-5"))
-        if move_in_tag:
-            move_in = move_in_tag.get_text(strip=True)
-
-        img_url = None
-        img_tag = div.find("img")
-        if img_tag and img_tag.get("src"):
-            img_url = img_tag["src"]
-            if img_url.startswith("/"):
-                img_url = "https://www.wg-gesucht.de" + img_url
-
-        if title_tag and link_tag and price is not None and price <= MAX_PRICE:
-            title = title_tag.get_text(strip=True)
-            link = "https://www.wg-gesucht.de" + link_tag["href"]
-            offers.append((offer_id, title, link, price, size, move_in, img_url, category))
-    return offers
-
-def worker_loop():
-    send_msg(f"🔔 WG-бот запущен на Render (≤ €{MAX_PRICE}).")
-    while True:
-        try:
-            for category, url in SEARCH_URLS.items():
-                for (offer_id, title, link, price, size, move_in, img_url, cat) in fetch_offers(url, category):
-                    if offer_id not in seen_ids:
-                        seen_ids.add(offer_id)
-                        caption = (f"🏠 Новое объявление ({cat}):\n"
-                                   f"{title}\n"
-                                   f"💰 Цена: {price} €\n"
-                                   f"📐 Площадь: {size or 'не указано'}\n"
-                                   f"📅 Въезд: {move_in or 'не указано'}\n"
-                                   f"🔗 {link}")
-                        if img_url: send_photo(img_url, caption)
-                        else: send_msg(caption)
-        except Exception as e:
-            print("loop error:", e)
-        time.sleep(CHECK_INTERVAL + random.randint(0, 60))
-
-from flask import Flask
+# ── Flask (healthcheck для Render) ─────────────────────────────────────────────
 app = Flask(__name__)
-
-@app.get("/")
-def index(): return "WG bot is running"
-
-@app.get("/health")
+@app.route("/")
+def home(): return "WG bot is running"
+@app.route("/health")
 def health(): return "ok"
 
+# ── Вспомогательные функции ───────────────────────────────────────────────────
+def send_message(text: str):
+    try:
+        requests.post(f"{TG_API}/sendMessage",
+                      data={"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML"},
+                      timeout=15)
+    except Exception as e:
+        print("send_message error:", e)
+
+def fetch_offers(max_price: int):
+    """Возвращает список объявлений: [{id,title,price,url}] с ценой <= max_price"""
+    offers = []
+    for url in SEARCH_URLS:
+        try:
+            r = requests.get(url, headers=HEADERS, timeout=20)
+            r.raise_for_status()
+            soup = BeautifulSoup(r.text, "html.parser")
+            for ad in soup.find_all("div", class_="offer_list_item"):
+                ad_id = ad.get("adid")
+                if not ad_id:
+                    continue
+                title_tag = ad.find("h3")
+                price_tag = ad.find("div", class_="col-xs-3")
+                link_tag = ad.find("a", href=True)
+                if not title_tag or not price_tag or not link_tag:
+                    continue
+
+                # вытащим первую группу цифр как цену (обычно это warm/kalt цифра)
+                m = re.search(r"(\d+)", price_tag.get_text(strip=True))
+                price = int(m.group(1)) if m else 10**9
+                if price <= max_price:
+                    offers.append({
+                        "id": ad_id,
+                        "title": title_tag.get_text(strip=True),
+                        "price": price,
+                        "url": "https://www.wg-gesucht.de" + link_tag["href"]
+                    })
+        except Exception as e:
+            print("fetch_offers error:", e)
+    return offers
+
+def push_new_offers():
+    """Шлёт новые (ещё не виденные) объявления с лимитом runtime_max_price"""
+    global seen_ids
+    offers = fetch_offers(runtime_max_price)
+    sent = 0
+    for o in offers:
+        if o["id"] in seen_ids:
+            continue
+        seen_ids.add(o["id"])
+        msg = f"🏠 <b>{o['title']}</b>\n💰 {o['price']} €\n🔗 {o['url']}"
+        send_message(msg)
+        sent += 1
+    return sent
+
+def handle_updates():
+    """Обработчик команд /all, /help, /setprice N, /status"""
+    global last_update_id, runtime_max_price
+    try:
+        params = {"timeout": 0}
+        if last_update_id:
+            params["offset"] = last_update_id + 1
+        resp = requests.get(f"{TG_API}/getUpdates", params=params, timeout=15).json()
+        for upd in resp.get("result", []):
+            last_update_id = max(last_update_id, upd.get("update_id", 0))
+            msg = upd.get("message") or {}
+            if not msg:
+                continue
+            chat_id = msg.get("chat", {}).get("id")
+            if str(chat_id) != str(CHAT_ID):
+                continue  # игнорируем чужие чаты
+
+            text = (msg.get("text") or "").strip()
+            if text.lower().startswith("/help"):
+                send_message(
+                    "🤖 Команды:\n"
+                    "/all — показать все актуальные объявления (до 10)\n"
+                    "/setprice N — установить лимит цены, например /setprice 900\n"
+                    "/status — показать текущие настройки\n"
+                    "/help — список команд"
+                )
+            elif text.lower().startswith("/status"):
+                send_message(
+                    f"⚙️ Текущие настройки:\n"
+                    f"MAX_PRICE (runtime): €{runtime_max_price}\n"
+                    f"MAX_PRICE (default): €{DEFAULT_MAX}\n"
+                    f"CHECK_INTERVAL: {CHECK_INTERVAL} сек"
+                )
+            elif text.lower().startswith("/setprice"):
+                m = re.search(r"/setprice\s+(\d+)", text.lower())
+                if m:
+                    new_price = int(m.group(1))
+                    runtime_max_price = new_price
+                    send_message(f"✅ Лимит цены обновлён: теперь ≤ €{runtime_max_price}")
+                else:
+                    send_message("Укажите число: например, /setprice 900")
+            elif text.lower().startswith("/all"):
+                data = fetch_offers(runtime_max_price)
+                if not data:
+                    send_message("⚠️ Сейчас нет объявлений по вашим фильтрам.")
+                else:
+                    for o in data[:10]:
+                        send_message(f"🏠 <b>{o['title']}</b>\n💰 {o['price']} €\n🔗 {o['url']}")
+    except Exception as e:
+        print("handle_updates error:", e)
+
+def main_loop():
+    send_message(f"🔔 WG-бот запущен (порог ≤ €{runtime_max_price}). Напишите /help для команд.")
+    while True:
+        try:
+            # 1) обработать команды
+            handle_updates()
+            # 2) проверить новые объявления
+            push_new_offers()
+        except Exception as e:
+            print("main_loop error:", e)
+        time.sleep(CHECK_INTERVAL)
+
+# ── Запуск фонового цикла при старте веб-приложения ───────────────────────────
 import threading
-threading.Thread(target=worker_loop, daemon=True).start()
+threading.Thread(target=main_loop, daemon=True).start()
