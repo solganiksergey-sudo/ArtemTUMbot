@@ -5,16 +5,14 @@ import requests
 from bs4 import BeautifulSoup
 from flask import Flask
 
-# ── Конфиг из переменных окружения ─────────────────────────────────────────────
+# ── Конфиг ────────────────────────────────────────────────────────
 BOT_TOKEN       = os.environ["BOT_TOKEN"]
 CHAT_ID         = os.environ["CHAT_ID"]
 DEFAULT_MAX     = int(os.environ.get("MAX_PRICE", "800"))
 CHECK_INTERVAL  = int(os.environ.get("CHECK_INTERVAL", "300"))
 
-# Глобальный лимит цены (меняется командой /setprice)
 runtime_max_price = DEFAULT_MAX
 
-# Ссылки поиска
 SEARCH_URLS = [
     "https://www.wg-gesucht.de/1-zimmer-wohnungen-in-Muenchen.90.1.1.0.html",
     "https://www.wg-gesucht.de/wg-zimmer-in-Muenchen.90.0.1.0.html"
@@ -23,18 +21,17 @@ SEARCH_URLS = [
 TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 HEADERS = {"User-Agent": "Mozilla/5.0"}
 
-# Память
 seen_ids = set()
-last_update_id = 0  # чтобы не обрабатывать старые апдейты
+last_update_id = 0
 
-# ── Flask (healthcheck для Render) ─────────────────────────────────────────────
+# ── Flask (healthcheck для Render) ────────────────────────────────
 app = Flask(__name__)
 @app.route("/")
 def home(): return "WG bot is running"
 @app.route("/health")
 def health(): return "ok"
 
-# ── Вспомогательные функции ───────────────────────────────────────────────────
+# ── Telegram ─────────────────────────────────────────────────────
 def send_message(text: str):
     try:
         requests.post(f"{TG_API}/sendMessage",
@@ -43,8 +40,9 @@ def send_message(text: str):
     except Exception as e:
         print("send_message error:", e)
 
+# ── Парсер WG-Gesucht ─────────────────────────────────────────────
 def fetch_offers(max_price: int):
-    """Парсим WG-Gesucht и возвращаем список объявлений [{id,title,price,url}]"""
+    """Возвращает список объявлений [{id,title,price,url}]"""
     offers = []
     for url in SEARCH_URLS:
         try:
@@ -52,17 +50,16 @@ def fetch_offers(max_price: int):
             r.raise_for_status()
             soup = BeautifulSoup(r.text, "html.parser")
 
-            # Новая логика: объявления как article с data-id
-            for ad in soup.find_all("article", attrs={"data-id": True}):
-                ad_id = ad.get("data-id")
+            # Ищем карточки по id-шаблону "liste-details-ad-XXXXX"
+            for ad in soup.find_all("div", id=re.compile(r"liste-details-ad-\d+")):
+                ad_id = ad.get("id")
                 title_tag = ad.find("h3")
-                price_tag = ad.find(string=re.compile(r"€"))
                 link_tag = ad.find("a", href=True)
+                price_tag = ad.find(string=re.compile(r"€"))
 
                 if not ad_id or not title_tag or not price_tag or not link_tag:
                     continue
 
-                # Цена: ищем первую цифру
                 m = re.search(r"(\d+)", price_tag)
                 price = int(m.group(1)) if m else 10**9
 
@@ -77,8 +74,8 @@ def fetch_offers(max_price: int):
             print("fetch_offers error:", e)
     return offers
 
+# ── Логика ───────────────────────────────────────────────────────
 def push_new_offers():
-    """Шлёт новые (ещё не виденные) объявления"""
     global seen_ids
     offers = fetch_offers(runtime_max_price)
     sent = 0
@@ -92,7 +89,6 @@ def push_new_offers():
     return sent
 
 def handle_updates():
-    """Обрабатываем команды /all, /help, /status, /setprice"""
     global last_update_id, runtime_max_price
     try:
         params = {}
@@ -141,21 +137,19 @@ def handle_updates():
     except Exception as e:
         print("handle_updates error:", e)
 
-# ── Циклы ─────────────────────────────────────────────────────────────────────
+# ── Циклы ─────────────────────────────────────────────────────────
 def commands_loop():
-    """Проверяем команды каждые 3 сек"""
     send_message(f"🔔 WG-бот запущен (порог ≤ €{runtime_max_price}). Напишите /help для команд.")
     while True:
         handle_updates()
         time.sleep(3)
 
 def offers_loop():
-    """Проверяем новые объявления раз в CHECK_INTERVAL"""
     while True:
         push_new_offers()
         time.sleep(CHECK_INTERVAL)
 
-# ── Запуск ────────────────────────────────────────────────────────────────────
+# ── Запуск ───────────────────────────────────────────────────────
 import threading
 threading.Thread(target=commands_loop, daemon=True).start()
 threading.Thread(target=offers_loop, daemon=True).start()
